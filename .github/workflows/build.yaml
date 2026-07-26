@@ -175,9 +175,11 @@ jobs:
   release:
 
     name: Github release
-    needs: 
+    needs:
       - build
       - build-win
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -563,6 +565,8 @@ jobs:
 
     name: debian package - ${{ matrix.job.name }}
     needs: build
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
