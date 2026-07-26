@@ -220,6 +220,7 @@ jobs:
 
     name: Docker push - ${{ matrix.job.name }}
     needs: build
+    if: ${{ secrets.DOCKER_HUB_USERNAME != '' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -401,6 +402,7 @@ jobs:
 
     name: Docker push classic - ${{ matrix.job.name }}
     needs: build
+    if: ${{ secrets.DOCKER_HUB_USERNAME != '' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
