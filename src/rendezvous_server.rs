@@ -56,7 +56,7 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i32 = 30_000;
+const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 struct SafeWsSink {
@@ -104,6 +104,14 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
+
+// Store punch hole requests
+use once_cell::sync::Lazy;
+use tokio::sync::Mutex as TokioMutex; // differentiate if needed
+#[derive(Clone)]
+struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
+static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
+const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
 #[derive(Clone)]
 struct Inner {
@@ -432,16 +440,8 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    if self.pm.is_in_memory(&ph.id).await {
-                        self.handle_udp_punch_hole_request(addr, ph, key).await?;
-                    } else {
-                        // not in memory, fetch from db with spawn in case blocking me
-                        let mut me = self.clone();
-                        let key = key.to_owned();
-                        tokio::spawn(async move {
-                            allow_err!(me.handle_udp_punch_hole_request(addr, ph, &key).await);
-                        });
-                    }
+                    // UDP PunchHoleRequest is intentionally unsupported.
+                    // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     self.handle_hole_sent(phs, addr, Some(socket)).await?;
@@ -665,7 +665,7 @@ impl RendezvousServer {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;
@@ -891,6 +891,7 @@ impl RendezvousServer {
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
+            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -930,7 +931,7 @@ impl RendezvousServer {
         if let Some(peer) = self.pm.get(&id).await {
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
+                (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
             };
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
@@ -940,6 +941,23 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
+            
+            // record punch hole request (from addr -> peer id/peer_addr)
+            {
+                let from_ip = try_into_v4(addr).ip().to_string();
+                let to_ip = try_into_v4(peer_addr).ip().to_string();
+                let to_id_clone = id.clone();
+                let mut lock = PUNCH_REQS.lock().await;
+                let mut dup = false;
+                for e in lock.iter().rev().take(30) { // only check recent tail subset for speed
+                    if e.from_ip == from_ip && e.to_id == to_id_clone {
+                        if e.tm.elapsed().as_secs() < PUNCH_REQ_DEDUPE_SEC { dup = true; }
+                        break;
+                    }
+                }
+                if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+            }
+
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
@@ -1136,11 +1154,12 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
+                    "punch-requests(pr) [<number>] [-]",
                     "always-use-relay(aur) [Y|N]",
                     "test-geo(tg) <ip1> <ip2>",
                     "must-login(ml) [Y|N]",
@@ -1238,6 +1257,24 @@ impl RendezvousServer {
                         if let Some((id, (tm, ips))) = x {
                             let _ = writeln!(res, "{}: {}s {:?}", id, tm.elapsed().as_secs(), ips,);
                         }
+                    }
+                }
+            }
+            Some("punch-requests" | "pr") => {
+                use std::fmt::Write as _;
+                let mut lock = PUNCH_REQS.lock().await;
+                let arg = fds.next();
+                if let Some("-") = arg { lock.clear(); }
+                else {
+                    let mut start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                    let mut page_size = fds.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
+                    if page_size == 0 { page_size = 10; }
+                    for (_, e) in lock.iter().enumerate().skip(start).take(page_size) {
+                        let age = e.tm.elapsed();
+                        let event_system = std::time::SystemTime::now() - age;
+                        let event_iso = chrono::DateTime::<chrono::Utc>::from(event_system)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        let _ = writeln!(res, "{} {} -> {}@{}", event_iso, e.from_ip, e.to_id, e.to_ip);
                     }
                 }
             }
