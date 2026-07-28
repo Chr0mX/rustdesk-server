@@ -112,6 +112,7 @@ use tokio::sync::Mutex as TokioMutex; // differentiate if needed
 struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
+const PUNCH_REQS_MAX: usize = 10_000;
 
 #[derive(Clone)]
 struct Inner {
@@ -529,6 +530,24 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    // Same MUST_LOGIN enforcement as handle_punch_hole_request -
+                    // without this, a client could skip PunchHoleRequest
+                    // entirely and reach a peer via RequestRelay alone,
+                    // bypassing the login requirement.
+                    if MUST_LOGIN.load(Ordering::SeqCst) {
+                        let mut authed = !rf.token.is_empty();
+                        if authed && !jwt::SECRET.is_empty() {
+                            authed = jwt::verify_token(rf.token.as_str()).is_ok();
+                        }
+                        if !authed {
+                            log::warn!(
+                                "RequestRelay from {} for peer {} rejected - MUST_LOGIN is set and no valid token was provided",
+                                addr,
+                                rf.id
+                            );
+                            return true;
+                        }
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -955,7 +974,18 @@ impl RendezvousServer {
                         break;
                     }
                 }
-                if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+                if !dup {
+                    // Bound the buffer: entries older than the dedupe window
+                    // are useless for dedup anyway, and a hard cap on top of
+                    // that stops a burst of many distinct targets within the
+                    // window from growing this unboundedly (memory DoS).
+                    lock.retain(|e| e.tm.elapsed().as_secs() < PUNCH_REQ_DEDUPE_SEC);
+                    if lock.len() >= PUNCH_REQS_MAX {
+                        let excess = lock.len() - PUNCH_REQS_MAX + 1;
+                        lock.drain(0..excess);
+                    }
+                    lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone });
+                }
             }
 
             let mut msg_out = RendezvousMessage::new();
